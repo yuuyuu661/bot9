@@ -10,9 +10,9 @@ from discord.ext import commands, tasks
 from discord import app_commands
 
 # ========= 設定 =========
-TOKEN = os.getenv("DISCORD_TOKEN")  # Railway Variables などに設定
-GUILD_ID = 1398607685158440991      # ★あなたのサーバーID
-MATCH_CATEGORY_ID = 1403371745301495848  # ★固定カテゴリ（プライベートVC作成先）
+TOKEN = os.getenv("DISCORD_TOKEN")             # Railway Variables 等に設定
+GUILD_ID = 1398607685158440991                 # ★あなたのサーバーID
+MATCH_CATEGORY_ID = 1403371745301495848        # ★固定カテゴリ（プライベートVC作成先）
 
 # 性別ロール
 MALE_ROLE_ID = 1399390214295785623
@@ -29,8 +29,8 @@ JST = timezone(timedelta(hours=9))
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True          # 権限付与・ロール判定で必要
-intents.voice_states = True     # VC入退室の監視・自動削除に必要
+intents.members = True          # ロール判定・権限付与で必要
+intents.voice_states = True     # VC入退室監視で必要
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -44,12 +44,13 @@ gender_queues: Dict[int, Dict[str, Dict[int, datetime]]] = {}
 
 # 作成したVCのライフサイクル追跡
 class VCState:
-    __slots__ = ("guild_id", "member_ids", "created_at", "ever_joined")
+    __slots__ = ("guild_id", "member_ids", "created_at", "ever_joined", "both_joined")
     def __init__(self, guild_id: int, member_ids: Set[int]):
         self.guild_id = guild_id
         self.member_ids = set(member_ids)
         self.created_at = datetime.now(JST)
-        self.ever_joined = False  # 一度でも入室があったか
+        self.ever_joined = False   # 誰か一度でも入室したか
+        self.both_joined = False   # 2人とも入室したか
 
 vc_states: Dict[int, VCState] = {}  # vc_id -> VCState
 
@@ -111,8 +112,6 @@ class GenderMatchView(discord.ui.View):
             return
 
         # ロール判定
-        male_role = discord.Object(id=MALE_ROLE_ID)
-        female_role = discord.Object(id=FEMALE_ROLE_ID)
         has_male = any(r.id == MALE_ROLE_ID for r in user.roles)
         has_female = any(r.id == FEMALE_ROLE_ID for r in user.roles)
 
@@ -149,7 +148,6 @@ class GenderMatchView(discord.ui.View):
 async def create_private_vc_and_notify(guild: discord.Guild, m1: discord.Member, m2: discord.Member) -> None:
     category = guild.get_channel(MATCH_CATEGORY_ID)
     if not isinstance(category, discord.CategoryChannel):
-        # カテゴリ未設定
         for m in (m1, m2):
             try:
                 await m.send("❌ マッチング用のカテゴリが見つかりません。管理者に連絡してください。")
@@ -179,7 +177,8 @@ async def create_private_vc_and_notify(guild: discord.Guild, m1: discord.Member,
         return
 
     # 状態登録（アイドル削除監視＆入退出監視用）
-    vc_states[vc.id] = VCState(guild.id, {m1.id, m2.id})
+    st = VCState(guild.id, {m1.id, m2.id})
+    vc_states[vc.id] = st
 
     # DM通知
     for m in (m1, m2):
@@ -226,7 +225,6 @@ async def match_loop():
             random.shuffle(ready_f)
             guild = bot.get_guild(guild_id)
             if guild:
-                # ペアが作れるだけ作る
                 while ready_m and ready_f:
                     uid_m = ready_m.pop()
                     uid_f = ready_f.pop()
@@ -247,7 +245,6 @@ async def before_match_loop():
 @tasks.loop(seconds=30)
 async def vc_idle_watchdog():
     now = datetime.now(JST)
-    # コピーして安全にループ
     for vc_id, st in list(vc_states.items()):
         guild = bot.get_guild(st.guild_id)
         if not guild:
@@ -258,8 +255,10 @@ async def vc_idle_watchdog():
             vc_states.pop(vc_id, None)
             continue
 
-        # ever_joined = False のまま、一定時間経過 & 無人 → 削除
-        if not st.ever_joined and (now - st.created_at).total_seconds() >= VC_IDLE_DELETE_SECONDS:
+        # 「誰も一度も入室していない」かつ「5分経過」かつ「現在も無人」→ 削除
+        if (not st.ever_joined
+            and (now - st.created_at).total_seconds() >= VC_IDLE_DELETE_SECONDS
+            and len(ch.members) == 0):
             try:
                 await ch.delete(reason="5分間入室なしのため自動削除")
             except:
@@ -272,30 +271,32 @@ async def before_watchdog():
     await bot.wait_until_ready()
 
 
-# ========= VC入退室イベント（入室済み→全員退出で削除）=========
+# ========= VC入退室イベント =========
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # 監視対象VCに入ったら ever_joined を True に
+    # 入室側
     if after and after.channel and after.channel.id in vc_states:
         st = vc_states[after.channel.id]
-        st.ever_joined = True
+        ch = after.channel
+        if isinstance(ch, discord.VoiceChannel):
+            st.ever_joined = True  # 誰か入った
+            # 2人とも入室しているか
+            present_ids = {m.id for m in ch.members}
+            if st.member_ids.issubset(present_ids):
+                st.both_joined = True
 
-    # 監視対象VCから出たあと、そのVCが無人なら削除（ever_joinedがTrueのとき）
-    # before.channel が None のケースもあるので丁寧に
+    # 退出側
     ch = before.channel
     if ch and ch.id in vc_states:
         st = vc_states[ch.id]
-        try:
-            # 最新のメンバー数を確認
-            if isinstance(ch, discord.VoiceChannel):
-                if len(ch.members) == 0 and st.ever_joined:
-                    try:
-                        await ch.delete(reason="入室後、全員退出したため自動削除")
-                    except:
-                        pass
-                    vc_states.pop(ch.id, None)
-        except:
-            pass
+        if isinstance(ch, discord.VoiceChannel):
+            # 無人 かつ 「両方入室済み」 なら削除
+            if len(ch.members) == 0 and st.both_joined:
+                try:
+                    await ch.delete(reason="両方入室後、全員退出したため自動削除")
+                except:
+                    pass
+                vc_states.pop(ch.id, None)
 
 
 # ========= スラッシュコマンド =========
